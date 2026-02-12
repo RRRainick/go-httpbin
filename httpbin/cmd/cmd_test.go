@@ -32,6 +32,10 @@ const usage = `Usage of go-httpbin:
     	HTTPS Server certificate file
   -https-key-file string
     	HTTPS Server private key file
+  -ipv4
+    	Limit to IPv4 only (AF_INET)
+  -ipv6
+    	Limit to IPv6 only (AF_INET6)
   -log-format string
     	Log format (text or json) (default "text")
   -max-body-size int
@@ -257,6 +261,55 @@ func TestLoadConfig(t *testing.T) {
 		"https cert and key must both be provided, key only": {
 			args:    []string{"-https-key-file", "/tmp/test.crt"},
 			wantErr: errors.New("https cert and key must both be provided"),
+		},
+		"-ipv4 and -ipv6 are mutually exclusive": {
+			args:    []string{"-ipv4", "-ipv6"},
+			wantErr: errors.New("-ipv4 and -ipv6 are mutually exclusive"),
+		},
+		"ok -ipv4": {
+			args: []string{"-ipv4"},
+			// rawIPv4 is a private field and will be set but not verified in tests
+			wantCfg: &config{
+				ListenHost:           defaultListenHost,
+				ListenPort:           defaultListenPort,
+				MaxBodySize:          httpbin.DefaultMaxBodySize,
+				MaxDuration:          httpbin.DefaultMaxDuration,
+				LogFormat:            defaultLogFormat,
+				SrvMaxHeaderBytes:    defaultSrvMaxHeaderBytes,
+				SrvReadHeaderTimeout: defaultSrvReadHeaderTimeout,
+				SrvReadTimeout:       defaultSrvReadTimeout,
+				rawIPv4:              true,
+			},
+		},
+		"ok -ipv6": {
+			args: []string{"-ipv6"},
+			// When -ipv6 is used without explicit host, it auto-changes to "::"
+			wantCfg: &config{
+				ListenHost:           "::",
+				ListenPort:           defaultListenPort,
+				MaxBodySize:          httpbin.DefaultMaxBodySize,
+				MaxDuration:          httpbin.DefaultMaxDuration,
+				LogFormat:            defaultLogFormat,
+				SrvMaxHeaderBytes:    defaultSrvMaxHeaderBytes,
+				SrvReadHeaderTimeout: defaultSrvReadHeaderTimeout,
+				SrvReadTimeout:       defaultSrvReadTimeout,
+				rawIPv6:              true,
+			},
+		},
+		"ok -ipv6 with explicit host": {
+			args: []string{"-ipv6", "-host", "::1"},
+			// When explicit host is provided, it should not be changed
+			wantCfg: &config{
+				ListenHost:           "::1",
+				ListenPort:           defaultListenPort,
+				MaxBodySize:          httpbin.DefaultMaxBodySize,
+				MaxDuration:          httpbin.DefaultMaxDuration,
+				LogFormat:            defaultLogFormat,
+				SrvMaxHeaderBytes:    defaultSrvMaxHeaderBytes,
+				SrvReadHeaderTimeout: defaultSrvReadHeaderTimeout,
+				SrvReadTimeout:       defaultSrvReadTimeout,
+				rawIPv6:              true,
+			},
 		},
 		"ok https CLI": {
 			args: []string{

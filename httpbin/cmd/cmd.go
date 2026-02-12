@@ -143,6 +143,8 @@ type config struct {
 	// temporary placeholders for arguments that need extra processing
 	rawAllowedRedirectDomains string
 	rawUseRealHostname        bool
+	rawIPv4                   bool
+	rawIPv6                   bool
 }
 
 // ConfigError is used to signal an error with a command line argument or
@@ -178,6 +180,8 @@ func loadConfig(args []string, getEnvVal func(string) string, getEnviron func() 
 	fs.StringVar(&cfg.ExcludeHeaders, "exclude-headers", "", "Drop platform-specific headers. Comma-separated list of headers key to drop, supporting wildcard matching.")
 	fs.StringVar(&cfg.LogFormat, "log-format", defaultLogFormat, "Log format (text or json)")
 	fs.StringVar(&cfg.CCAlgorithm, "cc-algorithm", "", "TCP congestion control algorithm (e.g., bbr, cubic, reno)")
+	fs.BoolVar(&cfg.rawIPv4, "ipv4", false, "Limit to IPv4 only (AF_INET)")
+	fs.BoolVar(&cfg.rawIPv6, "ipv6", false, "Limit to IPv6 only (AF_INET6)")
 	fs.IntVar(&cfg.SrvMaxHeaderBytes, "srv-max-header-bytes", defaultSrvMaxHeaderBytes, "Value to use for the http.Server's MaxHeaderBytes option")
 	fs.DurationVar(&cfg.SrvReadHeaderTimeout, "srv-read-header-timeout", defaultSrvReadHeaderTimeout, "Value to use for the http.Server's ReadHeaderTimeout option")
 	fs.DurationVar(&cfg.SrvReadTimeout, "srv-read-timeout", defaultSrvReadTimeout, "Value to use for the http.Server's ReadTimeout option")
@@ -214,6 +218,18 @@ func loadConfig(args []string, getEnvVal func(string) string, getEnviron func() 
 	}
 
 	var err error
+
+	// Check for mutually exclusive flags
+	if cfg.rawIPv4 && cfg.rawIPv6 {
+		return nil, configErr("-ipv4 and -ipv6 are mutually exclusive")
+	}
+
+	// Auto-adjust default host for IPv6 mode
+	// If user specifies -ipv6 but keeps the default IPv4 host (0.0.0.0),
+	// automatically change it to IPv6 equivalent (::)
+	if cfg.rawIPv6 && cfg.ListenHost == defaultListenHost {
+		cfg.ListenHost = "::"
+	}
 
 	// Command line flags take precedence over environment vars, so we only
 	// check for environment vars if we have default values for our command
@@ -326,6 +342,8 @@ func loadConfig(args []string, getEnvVal func(string) string, getEnviron func() 
 	// reset temporary fields to their zero values
 	cfg.rawAllowedRedirectDomains = ""
 	cfg.rawUseRealHostname = false
+	// Note: rawIPv4 and rawIPv6 are NOT reset here because they are used later
+	// in listenAndServeGracefully to determine the network type
 
 	for _, envVar := range getEnviron() {
 		name, value, _ := strings.Cut(envVar, "=")
@@ -345,6 +363,17 @@ func getEnvBool(val string) bool {
 	return val == "1" || val == "true"
 }
 
+// getNetworkType returns the network type based on IPv4/IPv6 flags
+func getNetworkType(cfg *config) string {
+	if cfg.rawIPv4 {
+		return "tcp4"
+	}
+	if cfg.rawIPv6 {
+		return "tcp6"
+	}
+	return "tcp"
+}
+
 func listenAndServeGracefully(srv *http.Server, cfg *config, logger *slog.Logger) error {
 	doneCh := make(chan error, 1)
 
@@ -359,11 +388,21 @@ func listenAndServeGracefully(srv *http.Server, cfg *config, logger *slog.Logger
 		doneCh <- srv.Shutdown(ctx)
 	}()
 
+	networkType := getNetworkType(cfg)
+	var networkInfo string
+	if cfg.rawIPv4 {
+		networkInfo = " (IPv4)"
+	} else if cfg.rawIPv6 {
+		networkInfo = " (IPv6)"
+	}
+
 	var err error
-	if cfg.CCAlgorithm != "" {
-		// Create custom listener with congestion control algorithm
-		lc := &net.ListenConfig{
-			Control: func(network, address string, c syscall.RawConn) error {
+	if cfg.CCAlgorithm != "" || cfg.rawIPv4 || cfg.rawIPv6 {
+		// Create custom listener with congestion control algorithm and/or IP version
+		lc := &net.ListenConfig{}
+		
+		if cfg.CCAlgorithm != "" {
+			lc.Control = func(network, address string, c syscall.RawConn) error {
 				var setErr error
 				err := c.Control(func(fd uintptr) {
 					setErr = syscall.SetsockoptString(int(fd), syscall.IPPROTO_TCP, syscall.TCP_CONGESTION, cfg.CCAlgorithm)
@@ -372,21 +411,26 @@ func listenAndServeGracefully(srv *http.Server, cfg *config, logger *slog.Logger
 					return err
 				}
 				return setErr
-			},
+			}
 		}
 
-		ln, err := lc.Listen(context.Background(), "tcp", srv.Addr)
+		ln, err := lc.Listen(context.Background(), networkType, srv.Addr)
 		if err != nil {
-			logger.Error(fmt.Sprintf("failed to create listener with congestion control algorithm %q: %s", cfg.CCAlgorithm, err))
-			return fmt.Errorf("failed to create listener with congestion control algorithm %q: %w", cfg.CCAlgorithm, err)
+			logger.Error(fmt.Sprintf("failed to create listener: %s", err))
+			return fmt.Errorf("failed to create listener: %w", err)
 		}
 		defer ln.Close()
 
+		var ccInfo string
+		if cfg.CCAlgorithm != "" {
+			ccInfo = fmt.Sprintf(" (cc: %s)", cfg.CCAlgorithm)
+		}
+
 		if cfg.TLSCertFile != "" && cfg.TLSKeyFile != "" {
-			logger.Info(fmt.Sprintf("go-httpbin listening on https://%s (cc: %s)", srv.Addr, cfg.CCAlgorithm))
+			logger.Info(fmt.Sprintf("go-httpbin listening on https://%s%s%s", srv.Addr, networkInfo, ccInfo))
 			err = srv.ServeTLS(ln, cfg.TLSCertFile, cfg.TLSKeyFile)
 		} else {
-			logger.Info(fmt.Sprintf("go-httpbin listening on http://%s (cc: %s)", srv.Addr, cfg.CCAlgorithm))
+			logger.Info(fmt.Sprintf("go-httpbin listening on http://%s%s%s", srv.Addr, networkInfo, ccInfo))
 			err = srv.Serve(ln)
 		}
 	} else {
