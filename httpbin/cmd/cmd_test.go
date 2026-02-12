@@ -22,6 +22,8 @@ import (
 const usage = `Usage of go-httpbin:
   -allowed-redirect-domains string
     	Comma-separated list of domains the /redirect-to endpoint will allow
+  -cc-algorithm string
+    	TCP congestion control algorithm (e.g., bbr, cubic, reno)
   -exclude-headers string
     	Drop platform-specific headers. Comma-separated list of headers key to drop, supporting wildcard matching.
   -host string

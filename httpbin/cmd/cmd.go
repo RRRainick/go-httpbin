@@ -127,6 +127,7 @@ type config struct {
 	TLSCertFile            string
 	TLSKeyFile             string
 	LogFormat              string
+	CCAlgorithm            string
 	SrvMaxHeaderBytes      int
 	SrvReadHeaderTimeout   time.Duration
 	SrvReadTimeout         time.Duration
@@ -176,6 +177,7 @@ func loadConfig(args []string, getEnvVal func(string) string, getEnviron func() 
 	fs.StringVar(&cfg.TLSKeyFile, "https-key-file", "", "HTTPS Server private key file")
 	fs.StringVar(&cfg.ExcludeHeaders, "exclude-headers", "", "Drop platform-specific headers. Comma-separated list of headers key to drop, supporting wildcard matching.")
 	fs.StringVar(&cfg.LogFormat, "log-format", defaultLogFormat, "Log format (text or json)")
+	fs.StringVar(&cfg.CCAlgorithm, "cc-algorithm", "", "TCP congestion control algorithm (e.g., bbr, cubic, reno)")
 	fs.IntVar(&cfg.SrvMaxHeaderBytes, "srv-max-header-bytes", defaultSrvMaxHeaderBytes, "Value to use for the http.Server's MaxHeaderBytes option")
 	fs.DurationVar(&cfg.SrvReadHeaderTimeout, "srv-read-header-timeout", defaultSrvReadHeaderTimeout, "Value to use for the http.Server's ReadHeaderTimeout option")
 	fs.DurationVar(&cfg.SrvReadTimeout, "srv-read-timeout", defaultSrvReadTimeout, "Value to use for the http.Server's ReadTimeout option")
@@ -273,6 +275,10 @@ func loadConfig(args []string, getEnvVal func(string) string, getEnviron func() 
 		return nil, configErr(`invalid log format %q, must be "text" or "json"`, cfg.LogFormat)
 	}
 
+	if cfg.CCAlgorithm == "" && getEnvVal("CC_ALGORITHM") != "" {
+		cfg.CCAlgorithm = getEnvVal("CC_ALGORITHM")
+	}
+
 	if getEnvBool(getEnvVal("USE_REAL_HOSTNAME")) {
 		cfg.rawUseRealHostname = true
 	}
@@ -354,12 +360,43 @@ func listenAndServeGracefully(srv *http.Server, cfg *config, logger *slog.Logger
 	}()
 
 	var err error
-	if cfg.TLSCertFile != "" && cfg.TLSKeyFile != "" {
-		logger.Info(fmt.Sprintf("go-httpbin listening on https://%s", srv.Addr))
-		err = srv.ListenAndServeTLS(cfg.TLSCertFile, cfg.TLSKeyFile)
+	if cfg.CCAlgorithm != "" {
+		// Create custom listener with congestion control algorithm
+		lc := &net.ListenConfig{
+			Control: func(network, address string, c syscall.RawConn) error {
+				var setErr error
+				err := c.Control(func(fd uintptr) {
+					setErr = syscall.SetsockoptString(int(fd), syscall.IPPROTO_TCP, syscall.TCP_CONGESTION, cfg.CCAlgorithm)
+				})
+				if err != nil {
+					return err
+				}
+				return setErr
+			},
+		}
+
+		ln, err := lc.Listen(context.Background(), "tcp", srv.Addr)
+		if err != nil {
+			logger.Error(fmt.Sprintf("failed to create listener with congestion control algorithm %q: %s", cfg.CCAlgorithm, err))
+			return fmt.Errorf("failed to create listener with congestion control algorithm %q: %w", cfg.CCAlgorithm, err)
+		}
+		defer ln.Close()
+
+		if cfg.TLSCertFile != "" && cfg.TLSKeyFile != "" {
+			logger.Info(fmt.Sprintf("go-httpbin listening on https://%s (cc: %s)", srv.Addr, cfg.CCAlgorithm))
+			err = srv.ServeTLS(ln, cfg.TLSCertFile, cfg.TLSKeyFile)
+		} else {
+			logger.Info(fmt.Sprintf("go-httpbin listening on http://%s (cc: %s)", srv.Addr, cfg.CCAlgorithm))
+			err = srv.Serve(ln)
+		}
 	} else {
-		logger.Info(fmt.Sprintf("go-httpbin listening on http://%s", srv.Addr))
-		err = srv.ListenAndServe()
+		if cfg.TLSCertFile != "" && cfg.TLSKeyFile != "" {
+			logger.Info(fmt.Sprintf("go-httpbin listening on https://%s", srv.Addr))
+			err = srv.ListenAndServeTLS(cfg.TLSCertFile, cfg.TLSKeyFile)
+		} else {
+			logger.Info(fmt.Sprintf("go-httpbin listening on http://%s", srv.Addr))
+			err = srv.ListenAndServe()
+		}
 	}
 	if err != nil && err != http.ErrServerClosed {
 		return err
