@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"html"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -952,6 +953,51 @@ func (h *HTTPBin) handleBytes(w http.ResponseWriter, r *http.Request, streaming 
 
 	var chunkSize int
 	var write func([]byte)
+
+	// High-performance path: Try to Hijack the connection if no seed is used.
+	// This allows us to set a large SO_SNDBUF and bypass HTTP layer overhead.
+	if r.URL.Query().Get("seed") == "" && r.ProtoMajor == 1 {
+		if hj, ok := w.(http.Hijacker); ok {
+			conn, _, err := hj.Hijack()
+			if err == nil {
+				defer conn.Close()
+
+				// Increase kernel send buffer to allow BBR STARTUP to fill the pipe
+				// effectively even if the user-space goroutine is descheduled briefly.
+				if tcpConn, ok := conn.(*net.TCPConn); ok {
+					tcpConn.SetWriteBuffer(16 * 1024 * 1024) // 16MB
+				}
+
+				// Write HTTP response line and headers manually
+				fmt.Fprintf(conn, "HTTP/%d.%d 200 OK\r\n", r.ProtoMajor, r.ProtoMinor)
+				fmt.Fprintf(conn, "Content-Type: %s\r\n", binaryContentType)
+				if !streaming {
+					fmt.Fprintf(conn, "Content-Length: %d\r\n", numBytes)
+				}
+				fmt.Fprintf(conn, "Connection: close\r\n\r\n")
+
+				// Send data in 1MB blocks to keep syscall overhead low and throughput high
+				chunkSize = 1024 * 1024
+				for i := 0; i < numBytes; i += chunkSize {
+					rem := numBytes - i
+					if rem > chunkSize {
+						rem = chunkSize
+					}
+					for rem > 0 {
+						toWrite := rem
+						if toWrite > len(h.randomBytes) {
+							toWrite = len(h.randomBytes)
+						}
+						if _, err := conn.Write(h.randomBytes[:toWrite]); err != nil {
+							return
+						}
+						rem -= toWrite
+					}
+				}
+				return
+			}
+		}
+	}
 
 	if streaming {
 		var isDefaultChunk bool
