@@ -2,6 +2,7 @@ package httpbin
 
 import (
 	"bytes"
+	"math/rand"
 	"net/http"
 	"time"
 )
@@ -93,10 +94,16 @@ type HTTPBin struct {
 	// /headers response
 	excludeHeadersProcessor headersProcessorFunc
 
+	// Pre-filled buffer of random bytes used to quickly serve large /bytes
+	// requests without per-request generation overhead.
+	randomBytes []byte
+
 	// Max number of SSE events to send, based on rough estimate of single
 	// event's size
 	maxSSECount int64
 }
+
+const randomBytesBufferSize = 128 * 1024 * 1024 // 128MB
 
 // New creates a new HTTPBin instance
 func New(opts ...OptionFunc) *HTTPBin {
@@ -109,6 +116,12 @@ func New(opts ...OptionFunc) *HTTPBin {
 	for _, opt := range opts {
 		opt(h)
 	}
+
+	// Initialize the random bytes buffer
+	h.randomBytes = make([]byte, randomBytesBufferSize)
+	src := rand.NewSource(time.Now().UnixNano())
+	rng := rand.New(src)
+	rng.Read(h.randomBytes)
 
 	// pre-compute some configuration values and pre-render templates
 	tmplData := struct{ Prefix string }{Prefix: h.prefix}

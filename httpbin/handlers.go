@@ -954,6 +954,7 @@ func (h *HTTPBin) handleBytes(w http.ResponseWriter, r *http.Request, streaming 
 	var write func([]byte)
 
 	if streaming {
+		var isDefaultChunk bool
 		if r.URL.Query().Get("chunk_size") != "" {
 			chunkSize, err = strconv.Atoi(r.URL.Query().Get("chunk_size"))
 			if err != nil {
@@ -961,38 +962,87 @@ func (h *HTTPBin) handleBytes(w http.ResponseWriter, r *http.Request, streaming 
 				return
 			}
 		} else {
-			chunkSize = 10 * 1024
+			chunkSize = 1024 * 1024 // 1MB default for streaming
+			isDefaultChunk = true
 		}
 
 		write = func() func(chunk []byte) {
-			f := w.(http.Flusher)
+			f, ok := w.(http.Flusher)
 			return func(chunk []byte) {
 				w.Write(chunk)
-				f.Flush()
+				// Only flush if user explicitly set a chunk size (to show real chunks)
+				// or if it's the end. If it's a default large chunk, don't flush
+				// to avoid app_limited status.
+				if ok && !isDefaultChunk {
+					f.Flush()
+				}
 			}
 		}()
-	} else {
-		// if not streaming, we will write the whole response at once
-		chunkSize = numBytes
-		w.Header().Set("Content-Length", strconv.Itoa(numBytes))
-		write = func(chunk []byte) {
-			w.Write(chunk)
-		}
 	}
 
 	w.Header().Set("Content-Type", binaryContentType)
+	if !streaming {
+		w.Header().Set("Content-Length", strconv.Itoa(numBytes))
+	}
 	w.WriteHeader(http.StatusOK)
 
-	var chunk []byte
-	for i := 0; i < numBytes; i++ {
-		chunk = append(chunk, byte(rng.Intn(256)))
-		if len(chunk) == chunkSize {
-			write(chunk)
-			chunk = nil
+	// If a seed was provided, we MUST use the same (slow) generation logic to
+	// maintain exact sequence compatibility with the original httpbin.
+	if r.URL.Query().Get("seed") != "" {
+		// (seed path implementation logic ...)
+		if streaming {
+			// streaming closure logic
+			var chunk []byte
+			for i := 0; i < numBytes; i++ {
+				chunk = append(chunk, byte(rng.Intn(256)))
+				if len(chunk) == chunkSize {
+					write(chunk)
+					chunk = nil
+				}
+			}
+			if len(chunk) > 0 {
+				write(chunk)
+			}
+		} else {
+			// non-streaming but with seed
+			buf := make([]byte, numBytes)
+			for i := 0; i < numBytes; i++ {
+				buf[i] = byte(rng.Intn(256))
+			}
+			w.Write(buf)
 		}
+		return
 	}
-	if len(chunk) > 0 {
-		write(chunk)
+
+	// For the common case (no seed), use the pre-filled buffer to quickly
+	// serve the response.
+	if streaming {
+		for i := 0; i < numBytes; i += chunkSize {
+			rem := numBytes - i
+			if rem > chunkSize {
+				rem = chunkSize
+			}
+			// Write directly from pre-filled buffer
+			for rem > 0 {
+				toWrite := rem
+				if toWrite > len(h.randomBytes) {
+					toWrite = len(h.randomBytes)
+				}
+				write(h.randomBytes[:toWrite])
+				rem -= toWrite
+			}
+		}
+	} else {
+		// Optimized non-streaming path: directly loop w.Write to saturate link
+		for i := 0; i < numBytes; i += len(h.randomBytes) {
+			toWrite := numBytes - i
+			if toWrite > len(h.randomBytes) {
+				toWrite = len(h.randomBytes)
+			}
+			if _, err := w.Write(h.randomBytes[:toWrite]); err != nil {
+				return
+			}
+		}
 	}
 }
 
